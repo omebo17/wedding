@@ -1,0 +1,200 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Photo and video wall for the wedding site. Guests upload straight to S3 with
+  presigned URLs — the bytes never pass through Lambda, so a 4GB phone video
+  costs the same in compute as a selfie and arrives byte-identical.
+
+Parameters:
+  SiteOrigin:
+    Type: String
+    Default: '*'
+    Description: >
+      Origin allowed to call the API and PUT to the bucket, e.g.
+      https://oto-and-mari.example. Leave as * only while developing.
+  SingleShotLimitMB:
+    Type: Number
+    Default: 8
+    Description: Files at or under this size go up in one PUT; larger ones use multipart.
+  PartSizeMB:
+    Type: Number
+    Default: 16
+    Description: Multipart chunk size. 16MB x 10000 parts caps a single file at 160GB.
+
+# The bucket's name is computed rather than generated, so the Lambdas can
+# be granted access to it by name. Using !Ref would make each function
+# depend on the bucket while the bucket depends on the thumbnailer through
+# its notification — which is a cycle CloudFormation refuses to build.
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Architectures: [arm64]
+    Timeout: 30
+    MemorySize: 512
+    Environment:
+      Variables:
+        MEDIA_BUCKET: !Sub '${AWS::StackName}-${AWS::AccountId}-media'
+        MEDIA_TABLE: !Ref MediaTable
+        SITE_ORIGIN: !Ref SiteOrigin
+        SINGLE_SHOT_LIMIT_MB: !Ref SingleShotLimitMB
+        PART_SIZE_MB: !Ref PartSizeMB
+
+Resources:
+  # ------------------------------------------------------------------ #
+  # Storage
+  # ------------------------------------------------------------------ #
+  MediaBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-${AWS::AccountId}-media'
+      # Private. Everything is read back through presigned GETs, so there is
+      # no public bucket policy and no way to enumerate the wall by guessing
+      # keys.
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins: [!Ref SiteOrigin]
+            AllowedMethods: [GET, PUT, HEAD]
+            AllowedHeaders: ['*']
+            # ETag has to be exposed or the browser cannot read it, and
+            # multipart completion needs every part's ETag.
+            ExposedHeaders: [ETag]
+            MaxAge: 3000
+      LifecycleConfiguration:
+        Rules:
+          - Id: bin-abandoned-multipart-uploads
+            Status: Enabled
+            # An empty prefix means "the whole bucket". CloudFormation's
+            # property validation wants the scope stated explicitly rather
+            # than inferred.
+            Prefix: ''
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: originals/
+            Function: !GetAtt ThumbFunction.Arn
+
+  MediaTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      # sk is an inverted timestamp, so a plain forward Query returns the
+      # newest first and pagination is a single opaque cursor.
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # ------------------------------------------------------------------ #
+  # API — one Lambda behind a Function URL. No API Gateway: nothing here
+  # needs its features, and the URL supports CORS on its own.
+  # ------------------------------------------------------------------ #
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./
+      Handler: src/api.handler
+      Description: Presigns uploads and serves the feed
+      # CORS is answered by the function itself (see the `headers` constant and
+      # the OPTIONS branch in src/api.ts). Configuring it here as well makes
+      # the Function URL append a second Access-Control-Allow-Origin, and a
+      # browser rejects a response that carries two of them.
+      FunctionUrlConfig:
+        AuthType: NONE
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Sub '${AWS::StackName}-${AWS::AccountId}-media'
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MediaTable
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: node22
+        Sourcemap: false
+        EntryPoints: [src/api.ts]
+
+  # ------------------------------------------------------------------ #
+  # Thumbnailer — fires on upload, writes a small JPEG beside the original.
+  # The original is never rewritten.
+  # ------------------------------------------------------------------ #
+  SharpLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub '${AWS::StackName}-sharp'
+      Description: sharp, built for the Lambda arm64 runtime
+      ContentUri: layer/
+      CompatibleRuntimes: [nodejs22.x]
+      CompatibleArchitectures: [arm64]
+      RetentionPolicy: Delete
+    Metadata:
+      # Build this with `sam build --use-container`, or npm installs sharp
+      # for your laptop's platform and the Lambda cannot load it.
+      BuildMethod: nodejs22.x
+
+  ThumbFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./
+      Handler: src/thumb.handler
+      Description: Makes gallery-sized thumbnails; leaves originals untouched
+      Timeout: 60
+      MemorySize: 2048
+      Layers:
+        - !Ref SharpLayer
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Sub '${AWS::StackName}-${AWS::AccountId}-media'
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MediaTable
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: false
+        Target: node22
+        Sourcemap: false
+        # sharp ships prebuilt native binaries, so esbuild cannot bundle it:
+        # it stays external and comes from the layer at runtime.
+        External: [sharp]
+        EntryPoints: [src/thumb.ts]
+
+  ThumbInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ThumbFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub 'arn:aws:s3:::${AWS::StackName}-${AWS::AccountId}-media'
+
+Outputs:
+  ApiUrl:
+    Description: Put this in the site's NEXT_PUBLIC_MEDIA_API
+    Value: !GetAtt ApiFunctionUrl.FunctionUrl
+  BucketName:
+    Value: !Sub '${AWS::StackName}-${AWS::AccountId}-media'
+  TableName:
+    Value: !Ref MediaTable

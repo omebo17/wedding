@@ -1,0 +1,8 @@
+{
+  "name": "sharp-layer",
+  "version": "1.0.0",
+  "description": "sharp for the thumbnailer. Native binaries, so it cannot be bundled — it ships as a layer built for arm64 Linux.",
+  "dependencies": {
+    "sharp": "^0.34.0"
+  }
+}

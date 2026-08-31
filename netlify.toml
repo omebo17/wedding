@@ -1,0 +1,18 @@
+# Netlify build settings for the wedding site.
+#
+# The site is a static export (see next.config.mjs), so there is no Next.js
+# runtime to install — Netlify just publishes the folder `next build` writes.
+
+[build]
+  command = "npm run build"
+  publish = "out"
+
+[build.environment]
+  NODE_VERSION = "22"
+
+# Long-lived caching for the hashed bundles. Their filenames change whenever
+# their contents do, so there is never a stale copy to worry about.
+[[headers]]
+  for = "/_next/static/*"
+  [headers.values]
+    Cache-Control = "public, max-age=31536000, immutable"

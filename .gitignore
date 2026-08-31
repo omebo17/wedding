@@ -1,0 +1,20 @@
+# dependencies
+node_modules
+
+# next.js
+.next
+out
+next-env.d.ts
+*.tsbuildinfo
+
+# local secrets and machine-specific config
+.env*.local
+
+# offline pixel-art preview scratch
+.preview.cjs
+frame.png
+
+# aws sam build output
+.aws-sam
+
+.DS_Store

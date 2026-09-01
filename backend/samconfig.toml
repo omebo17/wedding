@@ -6,7 +6,7 @@ resolve_s3 = true
 s3_prefix = "wedding-media"
 region = "eu-central-1"
 capabilities = "CAPABILITY_IAM"
-parameter_overrides = "SiteOrigin=\"*\" SingleShotLimitMB=\"8\" PartSizeMB=\"16\""
+parameter_overrides = "SiteOrigin=\"https://oto-and-mari-wedding.netlify.app\" SingleShotLimitMB=\"8\" PartSizeMB=\"16\""
 image_repositories = []
 
 [default.global.parameters]

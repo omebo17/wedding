@@ -20,6 +20,14 @@ Parameters:
     Type: Number
     Default: 16
     Description: Multipart chunk size. 16MB x 10000 parts caps a single file at 160GB.
+  AdminToken:
+    Type: String
+    NoEcho: true
+    MinLength: 16
+    Description: >
+      Secret that unlocks the moderation routes. This is the only thing standing
+      between a stranger and deleting the wedding photos, so make it long and
+      random, and pass it at deploy time rather than storing it in the repo.
 
 # The bucket's name is computed rather than generated, so the Lambdas can
 # be granted access to it by name. Using !Ref would make each function
@@ -38,6 +46,7 @@ Globals:
         SITE_ORIGIN: !Ref SiteOrigin
         SINGLE_SHOT_LIMIT_MB: !Ref SingleShotLimitMB
         PART_SIZE_MB: !Ref PartSizeMB
+        ADMIN_TOKEN: !Ref AdminToken
 
 Resources:
   # ------------------------------------------------------------------ #

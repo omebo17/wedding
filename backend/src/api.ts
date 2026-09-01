@@ -1,7 +1,8 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import {
   AbortMultipartUploadCommand,
   CompleteMultipartUploadCommand,
+  DeleteObjectsCommand,
   CreateMultipartUploadCommand,
   GetObjectCommand,
   PutObjectCommand,
@@ -35,6 +36,12 @@ import {
  *   POST /upload/abort     give up, bin the parts
  *   POST /poster           presign a PUT for a client-made video poster
  *   GET  /media?cursor=    the wall, newest first
+ *
+ * And behind an admin token, for taking things down:
+ *   POST /admin/list       the wall including hidden items
+ *   POST /admin/remove     hide an item from the wall (reversible)
+ *   POST /admin/restore    put a hidden item back
+ *   POST /admin/purge      delete the bytes for good
  * ==================================================================== */
 
 const s3 = new S3Client({});
@@ -47,6 +54,7 @@ const TABLE = process.env.MEDIA_TABLE!;
 const ORIGIN = process.env.SITE_ORIGIN || '*';
 const SINGLE_SHOT_LIMIT = Number(process.env.SINGLE_SHOT_LIMIT_MB ?? 8) * 1024 * 1024;
 const PART_SIZE = Number(process.env.PART_SIZE_MB ?? 16) * 1024 * 1024;
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN ?? '';
 
 /** S3's own ceiling: 10,000 parts per upload. */
 const MAX_PARTS = 10_000;
@@ -66,13 +74,14 @@ interface UrlEvent {
   body?: string;
   isBase64Encoded?: boolean;
   queryStringParameters?: Record<string, string | undefined>;
+  headers?: Record<string, string | undefined>;
   requestContext?: { http?: { method?: string; path?: string } };
 }
 
 const headers = {
   'content-type': 'application/json',
   'access-control-allow-origin': ORIGIN,
-  'access-control-allow-headers': 'content-type',
+  'access-control-allow-headers': 'content-type,x-admin-token',
   'access-control-allow-methods': 'GET,POST,OPTIONS',
   'cache-control': 'no-store',
 };
@@ -301,6 +310,30 @@ async function poster(body: Json) {
   return reply(200, { url, key });
 }
 
+/** One feed row as the site sees it. Both URLs are short-lived; nothing is public. */
+async function present(it: Record<string, unknown>) {
+  return {
+    id: it.id,
+    sk: it.sk,
+    kind: it.kind,
+    contentType: it.contentType,
+    size: it.size,
+    width: it.width,
+    height: it.height,
+    duration: it.duration,
+    createdAt: it.createdAt,
+    status: it.status,
+    thumbUrl: it.thumbKey
+      ? await getSignedUrl(s3, new GetObjectCommand({ Bucket: BUCKET, Key: String(it.thumbKey) }), {
+          expiresIn: GET_TTL,
+        })
+      : null,
+    url: await getSignedUrl(s3, new GetObjectCommand({ Bucket: BUCKET, Key: String(it.key) }), {
+      expiresIn: GET_TTL,
+    }),
+  };
+}
+
 async function feed(event: UrlEvent) {
   const cursorRaw = event.queryStringParameters?.cursor;
   let start: Record<string, unknown> | undefined;
@@ -324,34 +357,132 @@ async function feed(event: UrlEvent) {
     }),
   );
 
-  const items = await Promise.all(
-    (res.Items ?? []).slice(0, PAGE).map(async (it) => ({
-      id: it.id,
-      sk: it.sk,
-      kind: it.kind,
-      contentType: it.contentType,
-      size: it.size,
-      width: it.width,
-      height: it.height,
-      duration: it.duration,
-      createdAt: it.createdAt,
-      // Both URLs are short-lived and per-request; nothing is public.
-      thumbUrl: it.thumbKey
-        ? await getSignedUrl(s3, new GetObjectCommand({ Bucket: BUCKET, Key: it.thumbKey }), {
-            expiresIn: GET_TTL,
-          })
-        : null,
-      url: await getSignedUrl(s3, new GetObjectCommand({ Bucket: BUCKET, Key: it.key }), {
-        expiresIn: GET_TTL,
-      }),
-    })),
-  );
+  const items = await Promise.all((res.Items ?? []).slice(0, PAGE).map(present));
 
   const cursor = res.LastEvaluatedKey
     ? Buffer.from(JSON.stringify(res.LastEvaluatedKey)).toString('base64url')
     : null;
 
   return reply(200, { items, cursor });
+}
+
+/* ------------------------------------------------------------------ *
+ * Moderation.
+ *
+ * The gallery is a public URL that anyone at the wedding can reach, so the
+ * page that takes photos down cannot rely on being unlisted — a route name
+ * is discoverable, a token is not. Every route below refuses to do anything
+ * without the shared secret, and the browser never has it baked in: it is
+ * typed once on the page and kept only in that browser.
+ * ------------------------------------------------------------------ */
+
+/**
+ * Compare through SHA-256 digests so the buffers are always the same length
+ * (timingSafeEqual throws otherwise, which would itself leak the length) and
+ * a wrong guess takes the same time as a right one.
+ */
+function authorised(event: UrlEvent): boolean {
+  if (!ADMIN_TOKEN) return false;
+  const given = event.headers?.['x-admin-token'] ?? '';
+  if (!given) return false;
+  const a = createHash('sha256').update(given).digest();
+  const b = createHash('sha256').update(ADMIN_TOKEN).digest();
+  return timingSafeEqual(a, b);
+}
+
+/** The wall as the owner sees it: hidden items included, so they can come back. */
+async function adminList(body: Json) {
+  const state = body.state === 'removed' ? 'removed' : body.state === 'all' ? 'all' : 'ready';
+  let start: Record<string, unknown> | undefined;
+  if (body.cursor) {
+    try {
+      start = JSON.parse(Buffer.from(String(body.cursor), 'base64url').toString('utf8'));
+    } catch {
+      return reply(400, { error: 'bad cursor' });
+    }
+  }
+
+  const res = await ddb.send(
+    new QueryCommand({
+      TableName: TABLE,
+      KeyConditionExpression: 'pk = :pk',
+      ExpressionAttributeValues:
+        state === 'all' ? { ':pk': FEED } : { ':pk': FEED, ':want': state },
+      // An in-flight upload has status 'pending' and no bytes worth showing,
+      // so 'all' still excludes it.
+      FilterExpression: state === 'all' ? '#s <> :pending' : '#s = :want',
+      ExpressionAttributeNames: { '#s': 'status' },
+      Limit: PAGE * 2,
+      ExclusiveStartKey: start,
+    }),
+  );
+
+  const rows = (res.Items ?? []).filter((it) => it.status !== 'pending');
+  const items = await Promise.all(rows.slice(0, PAGE).map(present));
+  const cursor = res.LastEvaluatedKey
+    ? Buffer.from(JSON.stringify(res.LastEvaluatedKey)).toString('base64url')
+    : null;
+  return reply(200, { items, cursor });
+}
+
+/**
+ * Hiding is a status flip, not a delete. The gallery filters on status, so the
+ * item vanishes for guests immediately, while the bytes stay put — which
+ * matters when the thing you just tookdown was somebody's only copy.
+ */
+async function adminSetState(body: Json, status: 'ready' | 'removed') {
+  const sk = String(body.sk ?? '');
+  if (!sk) return reply(400, { error: 'bad request' });
+
+  const existing = await ddb.send(new GetCommand({ TableName: TABLE, Key: { pk: FEED, sk } }));
+  if (!existing.Item) return reply(404, { error: 'unknown item' });
+
+  await ddb.send(
+    new UpdateCommand({
+      TableName: TABLE,
+      Key: { pk: FEED, sk },
+      UpdateExpression: 'SET #s = :s, stateChangedAt = :t',
+      ExpressionAttributeNames: { '#s': 'status' },
+      ExpressionAttributeValues: { ':s': status, ':t': Date.now() },
+    }),
+  );
+  return reply(200, { ok: true, status });
+}
+
+/**
+ * The irreversible one. Deliberately refuses anything still visible: an item
+ * has to be hidden first, so a mis-tap on the grid can never destroy a file
+ * in one step.
+ */
+async function adminPurge(body: Json) {
+  const sk = String(body.sk ?? '');
+  if (!sk) return reply(400, { error: 'bad request' });
+
+  const existing = await ddb.send(new GetCommand({ TableName: TABLE, Key: { pk: FEED, sk } }));
+  const item = existing.Item;
+  if (!item) return reply(404, { error: 'unknown item' });
+  if (item.status !== 'removed') {
+    return reply(409, { error: 'hide it first, then delete' });
+  }
+
+  const keys = [String(item.key)];
+  if (item.thumbKey) keys.push(String(item.thumbKey));
+  await s3.send(
+    new DeleteObjectsCommand({
+      Bucket: BUCKET,
+      Delete: { Objects: keys.map((Key) => ({ Key })), Quiet: true },
+    }),
+  );
+
+  // Index rows last: if the S3 delete failed we still know what to retry.
+  await ddb.send(new DeleteCommand({ TableName: TABLE, Key: { pk: FEED, sk } }));
+  if (item.id) {
+    await ddb
+      .send(new DeleteCommand({ TableName: TABLE, Key: { pk: `id#${item.id}`, sk: 'ref' } }))
+      .catch(() => undefined);
+  }
+
+  return reply(200, { ok: true, purged: keys.length });
 }
 
 /* ------------------------------------------------------------------ */
@@ -371,6 +502,14 @@ export async function handler(event: UrlEvent) {
       if (path === '/upload/complete') return await complete(body);
       if (path === '/upload/abort') return await abort(body);
       if (path === '/poster') return await poster(body);
+
+      if (path.startsWith('/admin/')) {
+        if (!authorised(event)) return reply(401, { error: 'not allowed' });
+        if (path === '/admin/list') return await adminList(body);
+        if (path === '/admin/remove') return await adminSetState(body, 'removed');
+        if (path === '/admin/restore') return await adminSetState(body, 'ready');
+        if (path === '/admin/purge') return await adminPurge(body);
+      }
     }
     return reply(404, { error: 'no such route' });
   } catch (err) {

@@ -38,6 +38,8 @@ export interface FeedItem {
   createdAt: number;
   thumbUrl: string | null;
   url: string;
+  /** Only the moderation routes ever return anything but 'ready'. */
+  status?: 'ready' | 'removed';
 }
 
 export function apiConfigured(): boolean {
@@ -138,3 +140,51 @@ export async function fetchFeed(cursor?: string | null): Promise<{
   if (!res.ok) throw new Error(await describeFailure(res, '/media'));
   return (await res.json()) as { items: FeedItem[]; cursor: string | null };
 }
+
+/* ==================================================================== *
+ * Moderation.
+ *
+ * The admin token is never bundled into the site — it is typed on the
+ * hidden page and passed per request. That way the secret lives in one
+ * browser rather than in every copy of the JavaScript.
+ * ==================================================================== */
+
+export class UnauthorisedError extends Error {
+  constructor() {
+    super('That code was not accepted.');
+    this.name = 'UnauthorisedError';
+  }
+}
+
+export type AdminState = 'ready' | 'removed' | 'all';
+
+export interface AdminPage {
+  items: FeedItem[];
+  cursor: string | null;
+}
+
+async function adminPost<T>(path: string, token: string, body: unknown): Promise<T> {
+  assertConfigured();
+  const res = await fetch(`${BASE}${path}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-admin-token': token },
+    body: JSON.stringify(body),
+  });
+  if (res.status === 401) throw new UnauthorisedError();
+  if (!res.ok) throw new Error(await describeFailure(res, path));
+  return (await res.json()) as T;
+}
+
+export const adminList = (token: string, state: AdminState, cursor?: string | null) =>
+  adminPost<AdminPage>('/admin/list', token, { state, cursor: cursor ?? undefined });
+
+/** Vanishes from the guests' gallery at once; the file itself stays in S3. */
+export const adminRemove = (token: string, sk: string) =>
+  adminPost<{ ok: true }>('/admin/remove', token, { sk });
+
+export const adminRestore = (token: string, sk: string) =>
+  adminPost<{ ok: true }>('/admin/restore', token, { sk });
+
+/** Destroys the original and its thumbnail. The API refuses unless it is hidden. */
+export const adminPurge = (token: string, sk: string) =>
+  adminPost<{ ok: true; purged: number }>('/admin/purge', token, { sk });

@@ -16,3 +16,17 @@
   for = "/_next/static/*"
   [headers.values]
     Cache-Control = "public, max-age=31536000, immutable"
+
+# The moderation page is unlisted, not secret — but there is no reason to let a
+# search engine put it in an index. The real protection is the token check on
+# the API; this just keeps it out of results. Set as a header rather than in
+# robots.txt, because a robots.txt entry would itself advertise the path.
+[[headers]]
+  for = "/secret-page/*"
+  [headers.values]
+    X-Robots-Tag = "noindex, nofollow, noarchive"
+
+[[headers]]
+  for = "/secret-page"
+  [headers.values]
+    X-Robots-Tag = "noindex, nofollow, noarchive"

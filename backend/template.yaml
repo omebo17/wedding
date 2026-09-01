@@ -155,6 +155,11 @@ Resources:
     Properties:
       LayerName: !Sub '${AWS::StackName}-sharp'
       Description: sharp, built for the Lambda arm64 runtime
+      # package.json sits at the ROOT of this directory, not in a nodejs/
+      # subfolder. SAM's nodejs build method looks for the manifest at the
+      # ContentUri root and adds the nodejs/ wrapper Lambda requires itself —
+      # supplying our own produced nodejs/nodejs/ and, because no manifest was
+      # found at the root, no npm install at all.
       ContentUri: layer/
       CompatibleRuntimes: [nodejs22.x]
       CompatibleArchitectures: [arm64]

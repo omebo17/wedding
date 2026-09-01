@@ -21,3 +21,6 @@ frame.png
 
 # transfer scratch (safe to delete)
 .xfer
+
+# stale git lock files this session could not delete (safe to remove)
+_to_delete

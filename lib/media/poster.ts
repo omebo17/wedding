@@ -1,5 +1,5 @@
 /**
- * Poster frame for a video, made in the browser.
+ * Gallery thumbnails, made in the browser.
  *
  * The browser has just been handed a file it can already decode, so one
  * seek and a canvas draw gives a gallery thumbnail — no server-side ffmpeg,
@@ -53,6 +53,53 @@ export async function makeVideoPoster(file: File, longEdge = 720): Promise<Poste
     video.removeAttribute('src');
     video.load();
     URL.revokeObjectURL(url);
+  }
+}
+
+/**
+ * Thumbnail for a photo, made in the browser.
+ *
+ * The server side of this exists too — a Lambda with sharp — but it depends
+ * on a native binary matching the function's architecture, which is a thing
+ * that can silently stop being true. The browser already holds a decoded
+ * copy of the image the guest just picked, so making the thumbnail here costs
+ * one canvas draw and removes that whole class of failure. Whichever writes
+ * to thumbs/<id>.jpg first wins; they produce the same thing.
+ */
+export async function makeImageThumb(file: File, longEdge = 720): Promise<Poster | null> {
+  if (typeof document === 'undefined' || typeof createImageBitmap !== 'function') return null;
+
+  let bitmap: ImageBitmap | null = null;
+  try {
+    // from-image applies the EXIF rotation, which is what stops photos taken
+    // in portrait arriving on their side.
+    bitmap = await withTimeout(
+      createImageBitmap(file, { imageOrientation: 'from-image' }),
+      12000,
+    );
+    const { width: iw, height: ih } = bitmap;
+    if (!iw || !ih) return null;
+
+    const scale = Math.min(1, longEdge / Math.max(iw, ih));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(iw * scale));
+    canvas.height = Math.max(1, Math.round(ih * scale));
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return null;
+    ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+
+    const blob = await new Promise<Blob | null>((resolve) =>
+      canvas.toBlob(resolve, 'image/jpeg', 0.8),
+    );
+    if (!blob) return null;
+    return { blob, width: iw, height: ih, duration: 0 };
+  } catch {
+    // HEIC on a browser that will not decode it, a corrupt file, or an image
+    // too large for this device's canvas. The upload is untouched — the tile
+    // just waits on the server-side thumbnailer instead.
+    return null;
+  } finally {
+    bitmap?.close();
   }
 }
 

@@ -7,7 +7,7 @@ import {
   signParts,
   type InitResult,
 } from './api';
-import { makeVideoPoster } from './poster';
+import { makeImageThumb, makeVideoPoster } from './poster';
 import { allUploads, dropUpload, saveUpload, type StoredUpload } from './store';
 
 /* ==================================================================== *
@@ -290,9 +290,9 @@ export class Uploader {
         parts: [...t.parts.entries()].map(([partNumber, etag]) => ({ partNumber, etag })),
       });
 
-      // Poster last: the item is already on the wall by now, so a slow or
-      // failed poster never delays it appearing.
-      if (t.kind === 'video') await this.attachPoster(t).catch(() => undefined);
+      // Thumbnail last: the item is already on the wall by now, so a slow
+      // or failed thumbnail never delays it appearing.
+      await this.attachThumb(t).catch(() => undefined);
 
       t.status = 'done';
       t.sent = t.size;
@@ -405,8 +405,15 @@ export class Uploader {
     await Promise.all(Array.from({ length: Math.min(PART_CONCURRENCY, queue.length || 1) }, worker));
   }
 
-  private async attachPoster(t: Live): Promise<void> {
-    const poster = await makeVideoPoster(t.file);
+  /**
+   * Writes the gallery thumbnail: a seeked frame for video, a scaled copy for
+   * a photo. Doing it here rather than only in the thumbnailer Lambda means
+   * the wall stays light even if that function is down — without one, the
+   * grid falls back to full-size originals and a phone downloads megabytes
+   * per tile.
+   */
+  private async attachThumb(t: Live): Promise<void> {
+    const poster = t.kind === 'video' ? await makeVideoPoster(t.file) : await makeImageThumb(t.file);
     if (!poster) return;
     const target = await posterTarget({
       id: t.remote!.id,

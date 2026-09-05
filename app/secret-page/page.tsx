@@ -7,6 +7,7 @@ import {
   adminPurge,
   adminRemove,
   adminRestore,
+  adminRethumb,
   apiConfigured,
   UnauthorisedError,
   type FeedItem,
@@ -34,6 +35,7 @@ export default function SecretPage() {
   const [error, setError] = useState<string | null>(null);
   // sk of the item whose delete is one click from happening
   const [armed, setArmed] = useState<string | null>(null);
+  const [rebuilt, setRebuilt] = useState<string | null>(null);
 
   // Remember the code in this browser only, so a phone at the party does not
   // need it re-typed between checks.
@@ -76,6 +78,23 @@ export default function SecretPage() {
     setArmed(null);
     void load(tab);
   }, [tab, load]);
+
+  async function rebuildThumbs() {
+    setBusy(true);
+    try {
+      const r = await adminRethumb(token);
+      setRebuilt(
+        r.queued === 0
+          ? 'Every photo already has a thumbnail.'
+          : `Rebuilding ${r.queued} thumbnail${r.queued === 1 ? '' : 's'} — reload in a minute.`,
+      );
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'could not start the rebuild');
+    } finally {
+      setBusy(false);
+    }
+  }
 
   function unlock(e: React.FormEvent) {
     e.preventDefault();
@@ -181,22 +200,44 @@ export default function SecretPage() {
         >
           Hidden
         </button>
+        <button
+          type="button"
+          className="tab tab--quiet"
+          disabled={busy}
+          onClick={() => void rebuildThumbs()}
+        >
+          Rebuild thumbnails
+        </button>
         <button type="button" className="tab tab--quiet" onClick={lock}>
           Forget code
         </button>
       </div>
 
       {error && <p className="notice">{error}</p>}
+      {rebuilt && <p className="notice">{rebuilt}</p>}
 
       <div className="grid grid--admin">
         {items.map((item) => (
           <figure className="mod" key={item.sk}>
             <a className="mod__thumb" href={item.url} target="_blank" rel="noreferrer">
-              {item.thumbUrl ? (
+              {/* Without a preview here, picking the right photo to delete
+                  means opening them one at a time. Falls back to the original
+                  when the thumbnailer has not caught up. */}
+              {item.thumbUrl ?? (item.kind === 'image' ? item.url : null) ? (
                 // eslint-disable-next-line @next/next/no-img-element
-                <img src={item.thumbUrl} alt="" loading="lazy" decoding="async" />
+                <img
+                  src={item.thumbUrl ?? item.url}
+                  alt=""
+                  loading="lazy"
+                  decoding="async"
+                />
               ) : (
                 <span className="tile__blank">{item.kind === 'video' ? '▶' : '▣'}</span>
+              )}
+              {item.kind === 'video' && (
+                <span className="tile__badge" aria-hidden="true">
+                  ▶
+                </span>
               )}
             </a>
             <figcaption className="mod__meta">

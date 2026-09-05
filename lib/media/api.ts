@@ -188,3 +188,7 @@ export const adminRestore = (token: string, sk: string) =>
 /** Destroys the original and its thumbnail. The API refuses unless it is hidden. */
 export const adminPurge = (token: string, sk: string) =>
   adminPost<{ ok: true; purged: number }>('/admin/purge', token, { sk });
+
+/** Rebuilds thumbnails for anything that never got one. Safe to run twice. */
+export const adminRethumb = (token: string) =>
+  adminPost<{ ok: true; scanned: number; queued: number }>('/admin/rethumb', token, {});

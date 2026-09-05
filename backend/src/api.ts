@@ -1,3 +1,4 @@
+import { InvokeCommand, LambdaClient } from '@aws-sdk/client-lambda';
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import {
   AbortMultipartUploadCommand,
@@ -42,6 +43,7 @@ import {
  *   POST /admin/remove     hide an item from the wall (reversible)
  *   POST /admin/restore    put a hidden item back
  *   POST /admin/purge      delete the bytes for good
+ *   POST /admin/rethumb    rebuild thumbnails that were never made
  * ==================================================================== */
 
 const s3 = new S3Client({});
@@ -54,6 +56,9 @@ const TABLE = process.env.MEDIA_TABLE!;
 const ORIGIN = process.env.SITE_ORIGIN || '*';
 const SINGLE_SHOT_LIMIT = Number(process.env.SINGLE_SHOT_LIMIT_MB ?? 8) * 1024 * 1024;
 const PART_SIZE = Number(process.env.PART_SIZE_MB ?? 16) * 1024 * 1024;
+const lambda = new LambdaClient({});
+const THUMB_FUNCTION = process.env.THUMB_FUNCTION ?? '';
+
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN ?? '';
 
 /** S3's own ceiling: 10,000 parts per upload. */
@@ -310,6 +315,28 @@ async function poster(body: Json) {
   return reply(200, { url, key });
 }
 
+
+/**
+ * Where the next page starts.
+ *
+ * DynamoDB's LastEvaluatedKey marks where the SCAN stopped, not where our
+ * page ended. We over-read (Limit is PAGE * 2, because a FilterExpression is
+ * applied after the read) and then show PAGE of them, so whenever we truncate
+ * the rest of that read would be skipped entirely if we handed back
+ * LastEvaluatedKey. Resuming from the last row we actually showed is what
+ * makes the feed continuous.
+ */
+function nextCursor(
+  rows: Record<string, unknown>[],
+  shown: Record<string, unknown>[],
+  lastEvaluated: Record<string, unknown> | undefined,
+): string | null {
+  const truncated = rows.length > shown.length;
+  const last = shown[shown.length - 1];
+  const key = truncated && last ? { pk: last.pk, sk: last.sk } : lastEvaluated;
+  return key ? Buffer.from(JSON.stringify(key)).toString('base64url') : null;
+}
+
 /** One feed row as the site sees it. Both URLs are short-lived; nothing is public. */
 async function present(it: Record<string, unknown>) {
   return {
@@ -357,13 +384,11 @@ async function feed(event: UrlEvent) {
     }),
   );
 
-  const items = await Promise.all((res.Items ?? []).slice(0, PAGE).map(present));
+  const rows = res.Items ?? [];
+  const shown = rows.slice(0, PAGE);
+  const items = await Promise.all(shown.map(present));
 
-  const cursor = res.LastEvaluatedKey
-    ? Buffer.from(JSON.stringify(res.LastEvaluatedKey)).toString('base64url')
-    : null;
-
-  return reply(200, { items, cursor });
+  return reply(200, { items, cursor: nextCursor(rows, shown, res.LastEvaluatedKey) });
 }
 
 /* ------------------------------------------------------------------ *
@@ -418,11 +443,61 @@ async function adminList(body: Json) {
   );
 
   const rows = (res.Items ?? []).filter((it) => it.status !== 'pending');
-  const items = await Promise.all(rows.slice(0, PAGE).map(present));
-  const cursor = res.LastEvaluatedKey
-    ? Buffer.from(JSON.stringify(res.LastEvaluatedKey)).toString('base64url')
-    : null;
-  return reply(200, { items, cursor });
+  const shown = rows.slice(0, PAGE);
+  const items = await Promise.all(shown.map(present));
+  return reply(200, { items, cursor: nextCursor(rows, shown, res.LastEvaluatedKey) });
+}
+
+/**
+ * Rebuild missing thumbnails.
+ *
+ * The thumbnailer runs off an S3 notification, which fires exactly once. Any
+ * upload that landed while it was failing has no thumbnail and never will —
+ * and the gallery then falls back to the full-size original, which is slow on
+ * a phone. This walks the feed and re-invokes the thumbnailer for those.
+ */
+async function rethumb() {
+  if (!THUMB_FUNCTION) return reply(500, { error: 'thumbnailer not configured' });
+
+  const pending: string[] = [];
+  let start: Record<string, unknown> | undefined;
+  let scanned = 0;
+
+  // Bounded so one call cannot run past the API's timeout: a few hundred
+  // items is far more than a wedding produces, and it is safe to run again.
+  do {
+    const res = await ddb.send(
+      new QueryCommand({
+        TableName: TABLE,
+        KeyConditionExpression: 'pk = :pk',
+        ExpressionAttributeValues: { ':pk': FEED },
+        Limit: 200,
+        ExclusiveStartKey: start,
+      }),
+    );
+    for (const it of res.Items ?? []) {
+      scanned++;
+      if (it.kind === 'image' && !it.thumbKey && it.status !== 'pending' && it.key) {
+        pending.push(String(it.key));
+      }
+    }
+    start = res.LastEvaluatedKey;
+  } while (start && scanned < 1000);
+
+  // Event invocations return as soon as Lambda accepts them, so the whole
+  // backfill is queued in a couple of seconds rather than waited on here.
+  const BATCH = 10;
+  for (let i = 0; i < pending.length; i += BATCH) {
+    await lambda.send(
+      new InvokeCommand({
+        FunctionName: THUMB_FUNCTION,
+        InvocationType: 'Event',
+        Payload: Buffer.from(JSON.stringify({ keys: pending.slice(i, i + BATCH) })),
+      }),
+    );
+  }
+
+  return reply(200, { ok: true, scanned, queued: pending.length });
 }
 
 /**
@@ -509,6 +584,7 @@ export async function handler(event: UrlEvent) {
         if (path === '/admin/remove') return await adminSetState(body, 'removed');
         if (path === '/admin/restore') return await adminSetState(body, 'ready');
         if (path === '/admin/purge') return await adminPurge(body);
+        if (path === '/admin/rethumb') return await rethumb();
       }
     }
     return reply(404, { error: 'no such route' });

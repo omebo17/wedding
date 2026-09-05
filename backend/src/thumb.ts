@@ -28,11 +28,21 @@ const THUMB = 720;
 
 interface S3Event {
   Records?: Array<{ s3: { object: { key: string } } }>;
+  /* A direct invoke from /admin/rethumb, to fill in thumbnails for uploads
+     that arrived while this function was broken. The S3 notification for
+     those fired once and is long gone. */
+  keys?: string[];
+}
+
+function keysOf(event: S3Event): string[] {
+  if (event.keys?.length) return event.keys;
+  return (event.Records ?? []).map((r) =>
+    decodeURIComponent(r.s3.object.key.replace(/\+/g, ' ')),
+  );
 }
 
 export async function handler(event: S3Event) {
-  for (const record of event.Records ?? []) {
-    const key = decodeURIComponent(record.s3.object.key.replace(/\+/g, ' '));
+  for (const key of keysOf(event)) {
     const id = /originals\/([0-9a-f-]{36})\./.exec(key)?.[1];
     if (!id) {
       console.warn('key does not look like an upload', key);

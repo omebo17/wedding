@@ -133,11 +133,18 @@ Resources:
       # browser rejects a response that carries two of them.
       FunctionUrlConfig:
         AuthType: NONE
+      Environment:
+        Variables:
+          # /admin/rethumb re-invokes the thumbnailer for uploads whose S3
+          # notification fired while it was broken.
+          THUMB_FUNCTION: !Ref ThumbFunction
       Policies:
         - S3CrudPolicy:
             BucketName: !Sub '${AWS::StackName}-${AWS::AccountId}-media'
         - DynamoDBCrudPolicy:
             TableName: !Ref MediaTable
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ThumbFunction
     Metadata:
       BuildMethod: esbuild
       BuildProperties:

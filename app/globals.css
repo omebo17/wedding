@@ -448,6 +448,16 @@ body {
   border-radius: 0.3rem;
 }
 
+/* Blown up from 720px, so it is soft rather than sharp — which is the point:
+   it reads as the photo arriving, not as a broken one. */
+.shot {
+  width: auto;
+  height: auto;
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+}
+
 /* Big enough to hit with a thumb, and pinned beside the photo rather than
    under it so paging never means looking away from the picture. */
 .lightbox__arrow {

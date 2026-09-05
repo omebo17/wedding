@@ -234,8 +234,25 @@ export default function GalleryPage() {
                   playsInline
                 />
               ) : (
+                /* The thumbnail is already in cache from the grid, so painting
+                   it behind the original turns a five-second top-to-bottom
+                   reveal into an instant picture that sharpens. width/height
+                   are what make it work: they give the element its box before
+                   a single byte of the original has arrived. */
                 // eslint-disable-next-line @next/next/no-img-element
-                <img key={current.id} src={current.url} alt="" />
+                <img
+                  key={current.id}
+                  className="shot"
+                  src={current.url}
+                  width={current.width || undefined}
+                  height={current.height || undefined}
+                  style={
+                    current.thumbUrl
+                      ? { backgroundImage: `url("${current.thumbUrl}")` }
+                      : undefined
+                  }
+                  alt=""
+                />
               )}
             </div>
 

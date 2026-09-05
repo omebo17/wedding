@@ -36,7 +36,13 @@ Parameters:
 Globals:
   Function:
     Runtime: nodejs22.x
-    Architectures: [arm64]
+    # x86_64, not arm64. sharp ships its native binary as a per-platform
+    # package, so the layer is only loadable if npm installed it for the same
+    # architecture the function runs on — and the Docker build on a Windows
+    # x64 host produces x64 binaries whatever the template asks for. Matching
+    # the function to the binaries that actually get built is the reliable
+    # direction; arm64 would be ~20% cheaper on compute measured in cents.
+    Architectures: [x86_64]
     Timeout: 30
     MemorySize: 512
     Environment:
@@ -161,7 +167,7 @@ Resources:
     Type: AWS::Serverless::LayerVersion
     Properties:
       LayerName: !Sub '${AWS::StackName}-sharp'
-      Description: sharp, built for the Lambda arm64 runtime
+      Description: sharp, built for the Lambda x86_64 runtime
       # package.json sits at the ROOT of this directory, not in a nodejs/
       # subfolder. SAM's nodejs build method looks for the manifest at the
       # ContentUri root and adds the nodejs/ wrapper Lambda requires itself —
@@ -169,7 +175,7 @@ Resources:
       # found at the root, no npm install at all.
       ContentUri: layer/
       CompatibleRuntimes: [nodejs22.x]
-      CompatibleArchitectures: [arm64]
+      CompatibleArchitectures: [x86_64]
       RetentionPolicy: Delete
     Metadata:
       # Build this with `sam build --use-container`, or npm installs sharp
